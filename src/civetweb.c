@@ -432,7 +432,6 @@ _civet_safe_clock_gettime(int clk_id, struct timespec *t)
 
 #endif
 
-
 /********************************************************************/
 /* CivetWeb configuration defines */
 /********************************************************************/
@@ -1779,6 +1778,9 @@ typedef int socklen_t;
 #define MSG_NOSIGNAL (0)
 #endif
 
+#if defined(MG_MBEDTLS)
+#include "mod_mbedtls.inl"
+#endif
 
 #if defined(NO_SSL)
 typedef struct SSL SSL; /* dummy for SSL argument to push/pull */
@@ -2481,7 +2483,7 @@ enum {
 	STATIC_FILE_MAX_AGE,
 	STATIC_FILE_CACHE_CONTROL,
 #endif
-#if !defined(NO_SSL)
+#if !defined(NO_SSL) || defined(MG_MBEDTLS)
 	STRICT_HTTPS_MAX_AGE,
 #endif
 	ADDITIONAL_HEADER,
@@ -2599,7 +2601,7 @@ static const struct mg_option config_options[] = {
     {"static_file_max_age", MG_CONFIG_TYPE_NUMBER, "3600"},
     {"static_file_cache_control", MG_CONFIG_TYPE_STRING, NULL},
 #endif
-#if !defined(NO_SSL)
+#if !defined(NO_SSL) || defined(MG_MBEDTLS)
     {"strict_transport_security_max_age", MG_CONFIG_TYPE_NUMBER, NULL},
 #endif
     {"additional_header", MG_CONFIG_TYPE_STRING_MULTILINE, NULL},
@@ -2666,6 +2668,9 @@ enum {
 
 struct mg_domain_context {
 	SSL_CTX *ssl_ctx;                 /* SSL context */
+#if defined(MG_MBEDTLS)
+	mbed_context *mbed_ctx;
+#endif
 	char *config[NUM_OPTIONS];        /* Civetweb configuration parameters */
 	struct mg_handler_info *handlers; /* linked list of uri handlers */
 
@@ -2811,6 +2816,9 @@ struct mg_connection {
 	                 * mg_get_connection_info_impl */
 #endif
 
+#if defined(MG_MBEDTLS)
+	mbedtls_ssl_context *mbed_ssl;
+#endif
 	const char *host;       /* Host (HTTP/1.1 header or SNI) */
 	SSL *ssl;               /* SSL descriptor */
 	struct socket client;   /* Connected client */
@@ -6279,7 +6287,7 @@ static int
 push_inner(struct mg_context *ctx,
            FILE *fp,
            SOCKET sock,
-           SSL *ssl,
+           struct mg_connection *conn,
            const char *buf,
            int len,
            double timeout)
@@ -6305,7 +6313,7 @@ push_inner(struct mg_context *ctx,
 	}
 
 #if defined(NO_SSL)
-	if (ssl) {
+	if (conn->ssl) {
 		return -2;
 	}
 #endif
@@ -6315,10 +6323,10 @@ push_inner(struct mg_context *ctx,
 	for (;;) {
 
 #if !defined(NO_SSL)
-		if (ssl != NULL) {
-			n = SSL_write(ssl, buf, len);
+		if (conn->ssl != NULL) {
+			n = SSL_write(conn->ssl, buf, len);
 			if (n <= 0) {
-				err = SSL_get_error(ssl, n);
+				err = SSL_get_error(conn->ssl, n);
 				if ((err == SSL_ERROR_SYSCALL) && (n == -1)) {
 					err = ERRNO;
 				} else if ((err == SSL_ERROR_WANT_READ)
@@ -6326,6 +6334,23 @@ push_inner(struct mg_context *ctx,
 					n = 0;
 				} else {
 					DEBUG_TRACE("SSL_write() failed, error %d", err);
+					return -2;
+				}
+			} else {
+				err = 0;
+			}
+		} else
+#endif
+
+#if defined(MG_MBEDTLS)
+		    if (conn->mbed_ssl != NULL) {
+			n = mbed_ssl_write(conn->mbed_ssl, (const unsigned char *)buf, len);
+			if (n <= 0) {
+				if ((n == MBEDTLS_ERR_SSL_WANT_READ)
+				    || (n == MBEDTLS_ERR_SSL_WANT_WRITE)) {
+					n = 0;
+				} else {
+					DEBUG_TRACE("SSL write failed, error %d", n);
 					return -2;
 				}
 			} else {
@@ -6425,7 +6450,7 @@ static int
 push_all(struct mg_context *ctx,
          FILE *fp,
          SOCKET sock,
-         SSL *ssl,
+         struct mg_connection *conn,
          const char *buf,
          int len)
 {
@@ -6441,7 +6466,7 @@ push_all(struct mg_context *ctx,
 	}
 
 	while ((len > 0) && (ctx->stop_flag == 0)) {
-		n = push_inner(ctx, fp, sock, ssl, buf + nwritten, len, timeout);
+		n = push_inner(ctx, fp, sock, conn, buf + nwritten, len, timeout);
 		if (n < 0) {
 			if (nwritten == 0) {
 				nwritten = -1; /* Propagate the error */
@@ -6564,6 +6589,47 @@ pull_inner(FILE *fp,
 				err = 0;
 			}
 			ERR_clear_error();
+		} else if (pollres < 0) {
+			/* Error */
+			return -2;
+		} else {
+			/* pollres = 0 means timeout */
+			nread = 0;
+		}
+#endif
+
+#if defined(MG_MBEDTLS)
+	} else if (conn->mbed_ssl != NULL) {
+		/* We already know there is no more data buffered in conn->buf
+		 * but there is more available in the SSL layer. So don't poll
+		 * conn->client.sock yet. */
+		struct mg_pollfd pfd[1];
+		int pollres;
+
+		pfd[0].fd = conn->client.sock;
+		pfd[0].events = POLLIN;
+		pollres = mg_poll(pfd,
+		                  1,
+		                  (int)(timeout * 1000.0),
+		                  &(conn->phys_ctx->stop_flag));
+		if (conn->phys_ctx->stop_flag) {
+			return -2;
+		}
+
+		if (pollres > 0) {
+			nread = mbed_ssl_read(conn->mbed_ssl, (unsigned char *)buf, len);
+			if (nread <= 0) {
+				if ((nread == MBEDTLS_ERR_SSL_WANT_READ)
+				    || (nread == MBEDTLS_ERR_SSL_WANT_WRITE)) {
+					nread = 0;
+				} else {
+					DEBUG_TRACE("SSL read failed, error %d", nread);
+					return -2;
+				}
+			} else {
+				err = 0;
+			}
+
 		} else if (pollres < 0) {
 			/* Error */
 			return -2;
@@ -6907,7 +6973,7 @@ mg_write(struct mg_connection *conn, const void *buf, size_t len)
 		if ((total = push_all(conn->phys_ctx,
 		                      NULL,
 		                      conn->client.sock,
-		                      conn->ssl,
+		                      conn,
 		                      (const char *)buf,
 		                      allowed))
 		    == allowed) {
@@ -6920,7 +6986,7 @@ mg_write(struct mg_connection *conn, const void *buf, size_t len)
 				if ((n = push_all(conn->phys_ctx,
 				                  NULL,
 				                  conn->client.sock,
-				                  conn->ssl,
+				                  conn,
 				                  (const char *)buf,
 				                  allowed))
 				    != allowed) {
@@ -6937,7 +7003,7 @@ mg_write(struct mg_connection *conn, const void *buf, size_t len)
 		total = push_all(conn->phys_ctx,
 		                 NULL,
 		                 conn->client.sock,
-		                 conn->ssl,
+		                 conn,
 		                 (const char *)buf,
 		                 (int)len);
 	}
@@ -9732,9 +9798,15 @@ send_file_data(struct mg_connection *conn,
 /* file stored on disk */
 #if defined(__linux__)
 		/* sendfile is only available for Linux */
+#if defined(MG_MBEDTLS)
+		if ((conn->mbed_ssl == NULL) && (conn->throttle == 0)
+		    && (!mg_strcasecmp(conn->dom_ctx->config[ALLOW_SENDFILE_CALL],
+		                       "yes"))) {
+#else
 		if ((conn->ssl == 0) && (conn->throttle == 0)
 		    && (!mg_strcasecmp(conn->dom_ctx->config[ALLOW_SENDFILE_CALL],
 		                       "yes"))) {
+#endif
 			off_t sf_offs = (off_t)offset;
 			ssize_t sf_sent;
 			int sf_file = fileno(filep->access.fp);
@@ -10845,6 +10917,7 @@ read_message(FILE *fp,
 static int
 forward_body_data(struct mg_connection *conn, FILE *fp, SOCKET sock, SSL *ssl)
 {
+	(void)ssl;
 	const char *expect;
 	char buf[MG_BUF_LEN];
 	int success = 0;
@@ -10885,7 +10958,7 @@ forward_body_data(struct mg_connection *conn, FILE *fp, SOCKET sock, SSL *ssl)
 				success = (nread == 0);
 				break;
 			}
-			if (push_all(conn->phys_ctx, fp, sock, ssl, buf, nread) != nread) {
+			if (push_all(conn->phys_ctx, fp, sock, conn, buf, nread) != nread) {
 				break;
 			}
 		}
@@ -13349,7 +13422,11 @@ alloc_get_host(struct mg_connection *conn)
 			}
 		}
 
+#if defined(MG_MBEDTLS)
+		if (conn->mbed_ssl) {
+#else
 		if (conn->ssl) {
+#endif
 			/* This is a HTTPS connection, maybe we have a hostname
 			 * from SNI (set in ssl_servername_callback). */
 			const char *sslhost = conn->dom_ctx->config[AUTHENTICATION_DOMAIN];
@@ -14850,6 +14927,15 @@ set_ports_option(struct mg_context *phys_ctx)
 			    "[IP_ADDRESS:]PORT[s|r]");
 			continue;
 		}
+
+#if defined(MG_MBEDTLS)
+		if (so.is_ssl && phys_ctx->dd.mbed_ctx == NULL) {
+			mg_cry_ctx_internal(phys_ctx,
+			                    "Cannot add SSL socket (entry %i)",
+			                    portsTotal);
+			continue;
+		}
+#endif
 
 #if !defined(NO_SSL)
 		if (so.is_ssl && phys_ctx->dd.ssl_ctx == NULL) {
@@ -16443,6 +16529,48 @@ uninitialize_ssl(void)
 }
 #endif /* !NO_SSL */
 
+#if defined(MG_MBEDTLS)
+/* Check if SSL is required.
+ * If so, dynamically load SSL library
+ * and set up ctx->ssl_ctx pointer. */
+static int
+mg_sslctx_init(struct mg_context *phys_ctx, struct mg_domain_context *dom_ctx)
+{
+	const char *pem;
+
+	if (!phys_ctx) {
+		return 0;
+	}
+
+	if (!dom_ctx) {
+		dom_ctx = &(phys_ctx->dd);
+	}
+
+	if (!is_ssl_port_used(dom_ctx->config[LISTENING_PORTS])) {
+		/* No SSL port is set. No need to setup SSL. */
+		return 1;
+	}
+
+	dom_ctx->mbed_ctx = mg_calloc(1, sizeof(*dom_ctx->mbed_ctx));
+	if (dom_ctx->mbed_ctx == NULL) {
+		mg_cry_ctx_internal(phys_ctx,
+		                    "%s",
+		                    "Initializing SSL failed: -%s is not set");
+		return 0;
+	}
+
+	/* If PEM file is not specified setup will fail. */
+	if ((pem = dom_ctx->config[SSL_CERTIFICATE]) == NULL) {
+		/* Essential data to set up TLS is missing. */
+		mg_cry_ctx_internal(phys_ctx,
+		                    "Initializing SSL failed: -%s is not set",
+		                    config_options[SSL_CERTIFICATE].name);
+		return 0;
+	}
+
+	return mbed_sslctx_init(dom_ctx->mbed_ctx, pem) == 0 ? 1 : 0;
+}
+#endif /* MG_MBEDTLS */
 
 #if !defined(NO_FILESYSTEMS)
 static int
@@ -16693,6 +16821,14 @@ close_connection(struct mg_connection *conn)
 
 #if defined(USE_SERVER_STATS)
 	conn->conn_state = 7; /* closing */
+#endif
+
+#if defined(MG_MBEDTLS)
+	if (conn->mbed_ssl != NULL) {
+		mbed_ssl_close(conn->mbed_ssl);
+		mg_free(conn->mbed_ssl);
+		conn->mbed_ssl = NULL;
+	}
 #endif
 
 #if !defined(NO_SSL)
@@ -17960,6 +18096,7 @@ process_new_connection(struct mg_connection *conn)
 	}
 #endif
 
+	set_non_blocking_mode(conn->client.sock);
 	init_connection(conn);
 
 	DEBUG_TRACE("Start processing connection from %s",
@@ -18388,6 +18525,20 @@ worker_thread_run(struct mg_connection *conn)
 		conn->request_info.is_ssl = conn->client.is_ssl;
 
 		if (conn->client.is_ssl) {
+#if defined(MG_MBEDTLS)
+			/* HTTPS connection */
+			if (mbed_ssl_accept(&conn->mbed_ssl,
+			                    conn->dom_ctx->mbed_ctx,
+			                    &conn->client.sock)
+			    == 0) {
+				/* conn->dom_ctx is set in get_request */
+				/* process HTTPS connection */
+				process_new_connection(conn);
+			} else {
+				/* make sure the connection is cleaned up on SSL failure */
+				close_connection(conn);
+			}
+#endif
 #if !defined(NO_SSL)
 			/* HTTPS connection */
 			if (sslize(conn,
@@ -18566,7 +18717,7 @@ accept_new_connection(const struct socket *listener, struct mg_context *ctx)
 		/* The "non blocking" property should already be
 		 * inherited from the parent socket. Set it for
 		 * non-compliant socket implementations. */
-		set_non_blocking_mode(so.sock);
+		// set_non_blocking_mode(so.sock);
 
 		so.in_use = 0;
 		produce_socket(ctx, &so);
@@ -18789,6 +18940,14 @@ free_context(struct mg_context *ctx)
 		mg_free(tmp_rh->uri);
 		mg_free(tmp_rh);
 	}
+
+#if defined(MG_MBEDTLS)
+	if (ctx->dd.mbed_ctx != NULL) {
+		mbed_sslctx_uninit(ctx->dd.mbed_ctx);
+		mg_free(ctx->dd.mbed_ctx);
+		ctx->dd.mbed_ctx = NULL;
+	}
+#endif
 
 #if !defined(NO_SSL)
 	/* Deallocate SSL context */
@@ -19038,6 +19197,10 @@ static
 	ctx->dd.handlers = NULL;
 	ctx->dd.next = NULL;
 
+#if defined(MG_MBEDTLS)
+	ctx->dd.mbed_ctx = NULL;
+#endif
+
 #if defined(USE_LUA) && defined(USE_WEBSOCKET)
 	ctx->dd.shared_lua_websockets = NULL;
 #endif
@@ -19255,8 +19418,13 @@ static
 	}
 #endif
 
+#if !defined(NO_SSL) || defined(MG_MBEDTLS)
+
 #if !defined(NO_SSL)
 	if (!init_ssl_ctx(ctx, NULL)) {
+#elif defined(MG_MBEDTLS)
+	if (!mg_sslctx_init(ctx, NULL)) {
+#endif
 		const char *err_msg = "Error initializing SSL context";
 		/* Fatal error - abort start. */
 		mg_cry_ctx_internal(ctx, "%s", err_msg);
@@ -19758,7 +19926,7 @@ mg_check_feature(unsigned feature)
 #if !defined(NO_FILES)
 	                                    | MG_FEATURES_FILES
 #endif
-#if !defined(NO_SSL)
+#if !defined(NO_SSL) || defined(MG_MBEDTLS)
 	                                    | MG_FEATURES_SSL
 #endif
 #if !defined(NO_CGI)

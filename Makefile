@@ -130,6 +130,19 @@ ifdef WITH_DUKTAPE
   include resources/Makefile.in-duktape
 endif
 
+# Use Mbed TLS?
+ifdef WITH_MBEDTLS_VERSION
+  WITH_MBEDTLS = 1
+endif
+
+ifdef WITH_MBEDTLS_SHARED
+  WITH_MBEDTLS = 1
+endif
+
+ifdef WITH_MBEDTLS
+  include resources/Makefile.in-mbedtls
+endif
+
 # Use zlib?
 ifdef WITH_COMPRESSION
   WITH_ZLIB = 1
@@ -208,6 +221,10 @@ ifdef WITH_LUA_SHARED
 endif
 endif
 
+ifdef WITH_MBEDTLS_SHARED
+  LIBS += $(MBEDTLS_SHARED_LIB_FLAG)
+endif
+
 ifneq (, $(findstring mingw32, $(shell $(CC) -dumpmachine)))
   BUILD_RESOURCES = $(BUILD_DIR)/$(WINDOWS_RESOURCES:.rc=.o)
   LIBS += -lws2_32 -mwindows
@@ -237,6 +254,9 @@ help:
 	@echo "   WITH_DUKTAPE=1        build with Duktape support; include as static library"
 	@echo "   WITH_DUKTAPE_SHARED=1 build with Duktape support; use libduktape1.3.so"
 	@echo "   WITH_DUKTAPE_VERSION=108 build with Duktape 1.8.x"
+	@echo "   WITH_MBEDTLS=1        build with MbedTLS support; include as static library"
+	@echo "   WITH_MBEDTLS_SHARED=1 build with MbedTLS support; use dynamic linking"
+	@echo "   WITH_MBEDTLS_VERSION=207 build with Mbed TLS 2.7.x"
 	@echo "   WITH_DEBUG=1          build with GDB debug support"
 	@echo "   WITH_IPV6=1           with IPV6 support"
 	@echo "   WITH_WEBSOCKET=1      build with web socket support"

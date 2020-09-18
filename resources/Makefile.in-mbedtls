@@ -1,0 +1,79 @@
+#
+# Copyright (c) 2015-2020 the Civetweb developers
+#
+# License http://opensource.org/licenses/mit-license.php MIT License
+#
+
+ifndef WITH_MBEDTLS
+  $(error WITH_MBEDTLS is not defined)
+endif
+
+# Mbed TLS default version is 2.7.x (207)
+WITH_MBEDTLS_VERSION ?= 207
+MBEDTLS_VERSION_KNOWN = 0
+
+# Select src and header according to the Mbed TLS version
+ifeq ($(WITH_MBEDTLS_VERSION), 207)
+  $(info Mbed TLS: Using version 2.7.17)
+  MBEDTLS_DIR = src/third_party/mbedtls-2.7.17
+  MBEDTLS_SHARED_LIB_FLAG = -lmbedtls.so.10 -lmbedcrypto.so.2 -lmbedx509.so.0
+  MBEDTLS_CFLAGS =
+  MBEDTLS_VERSION_KNOWN = 1
+endif
+
+ifneq ($(MBEDTLS_VERSION_KNOWN), 1)
+  $(error Mbed TLS: Unknown version - $(WITH_MBEDTLS_VERSION))
+endif
+
+# Add flags for all Mbed TLS versions
+MBEDTLS_CFLAGS += -I$(MBEDTLS_DIR)/include -DNO_SSL -DMG_MBEDTLS
+
+OBJS_CRYPTO=    aes.o           aesni.o         arc4.o          \
+                asn1parse.o     asn1write.o     base64.o        \
+                bignum.o        blowfish.o      camellia.o      \
+                ccm.o           cipher.o        cipher_wrap.o   \
+                cmac.o          ctr_drbg.o      des.o           \
+                dhm.o           ecdh.o          ecdsa.o         \
+                ecjpake.o       ecp.o                           \
+                ecp_curves.o    entropy.o       entropy_poll.o  \
+                error.o         gcm.o           havege.o        \
+                hmac_drbg.o     md.o            md2.o           \
+                md4.o           md5.o           md_wrap.o       \
+                memory_buffer_alloc.o           oid.o           \
+                padlock.o       pem.o           pk.o            \
+                pk_wrap.o       pkcs12.o        pkcs5.o         \
+                pkparse.o       pkwrite.o       platform.o      \
+                ripemd160.o     rsa_internal.o  rsa.o           \
+                sha1.o          sha256.o        sha512.o        \
+                threading.o     timing.o        version.o       \
+                version_features.o              xtea.o
+
+OBJS_X509=      certs.o         pkcs11.o        x509.o          \
+                x509_create.o   x509_crl.o      x509_crt.o      \
+                x509_csr.o      x509write_crt.o x509write_csr.o
+
+OBJS_TLS=       debug.o         net_sockets.o           \
+                ssl_cache.o     ssl_ciphersuites.o      \
+                ssl_cli.o       ssl_cookie.o            \
+                ssl_srv.o       ssl_ticket.o            \
+                ssl_tls.o
+
+ifdef WITH_MBEDTLS_SHARED
+
+  $(info Mbed TLS: using dynamic linking)
+
+else
+
+  MBEDTLS_SOURCE_FILES = $(OBJS_CRYPTO) $(OBJS_X509) $(OBJS_TLS)
+
+  $(info Mbed TLS: using static library)
+
+endif
+
+MBEDTLS_SOURCES = $(addprefix $(MBEDTLS_DIR)/library/, $(MBEDTLS_SOURCE_FILES))
+MBEDTLS_OBJECTS = $(MBEDTLS_SOURCES:.c=.o)
+
+OBJECTS += $(MBEDTLS_OBJECTS)
+CFLAGS += $(MBEDTLS_CFLAGS)
+SOURCE_DIRS = $(MBEDTLS_DIR)
+BUILD_DIRS += $(BUILD_DIR)/$(MBEDTLS_DIR)/library
